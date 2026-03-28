@@ -3,7 +3,7 @@ name: solidity-evm
 description: >
   Expert-level guidance for writing, testing, auditing, deploying, and optimizing Solidity smart contracts on EVM-compatible chains (Ethereum, Base, Arbitrum, Optimism, Polygon, etc.).
   Use this skill whenever the user is: writing or reviewing Solidity code, building smart contracts (tokens, DeFi, NFTs, DAOs, access control, staking), asking about ERC standards (ERC-20/721/1155/4626/2981), setting up Foundry or Hardhat, writing contract tests or fuzz tests, deploying onchain, working with proxy/upgradeable contracts, asking about gas optimization, debugging transaction reverts or test failures, or auditing contracts for security vulnerabilities.
-  Trigger even for casual phrasing like "my contract keeps reverting", "how do I write a staking contract", "what is reentrancy", "what's the best way to deploy", or "how do I upgrade my contract".
+  Trigger even for casual phrasing like "my contract keeps reverting", "how do I write a staking contract", "what is reentrancy", "what's the best way to deploy", "how do I upgrade my contract", "deploy on Base/Arbitrum/L2", or "bridge tokens cross-chain".
 ---
 
 # Solidity & EVM Smart Contract Skill
@@ -16,11 +16,12 @@ This SKILL.md provides principles, patterns, and rules. For deep reference mater
 
 | File | When to read it |
 |------|----------------|
-| `references/security.md` | Vulnerability patterns, attack vectors, audit checklists |
-| `references/gas-optimization.md` | Storage layout, opcodes, optimization techniques |
-| `references/patterns.md` | Design patterns: proxy/upgradeable, factory, access control, state machine, pull-payment |
-| `references/tooling.md` | Foundry & Hardhat setup, test writing, deployment scripts, CI |
-| `references/erc-standards.md` | ERC-20, ERC-721, ERC-1155, ERC-4626, ERC-2981, ERC-4337, EIP-712 |
+| `references/security.md` | Vulnerability patterns, attack vectors, ABI encoding pitfalls, MEV protection, audit checklists |
+| `references/gas-optimization.md` | Storage layout, opcodes, optimization techniques, contract size limits, transient storage |
+| `references/patterns.md` | Design patterns: proxy/upgradeable, factory, access control, libraries, interfaces, CREATE2, OZ v5 migration |
+| `references/tooling.md` | Foundry & Hardhat setup, test writing, deployment scripts, CI, contract verification, multi-chain deploy |
+| `references/erc-standards.md` | ERC-20, ERC-721, ERC-1155, ERC-4626, ERC-2981, ERC-4337, EIP-712, Permit2, token integration checklist |
+| `references/l2-crosschain.md` | L2 gotchas, cross-chain messaging, bridge patterns, multi-chain deployment, L2 gas models |
 
 Read the relevant reference **before** generating code for any non-trivial task. For tasks touching security, proxy patterns, or unfamiliar ERCs, always read the reference.
 
@@ -51,6 +52,8 @@ pragma solidity ^0.8.24;
 - Avoid floating pragmas (`>=0.8.0 <0.9.0`) in final contracts; float only in libraries
 - `0.8.x+` includes built-in overflow/underflow protection — SafeMath is no longer needed
 - Use `0.8.20+` for ERC-7201 namespaced storage (upgradeable contracts)
+- Use `0.8.24+` for transient storage (`TSTORE`/`TLOAD`), named mapping parameters, and `using { fn } for Type global`
+- Use `0.8.26+` for custom storage layout with user-defined value types
 
 ---
 
@@ -301,6 +304,138 @@ Always comment assembly blocks extensively.
 
 ---
 
+## NatSpec Documentation
+
+Every public/external function and every contract MUST have NatSpec in production code. NatSpec powers `forge doc`, Etherscan display, and is critical for auditors.
+
+```solidity
+/// @title Vault — ETH deposit and withdrawal contract
+/// @author MyTeam
+/// @notice User-facing description of the contract
+/// @dev Implementation notes for developers
+contract Vault {
+    /// @notice Deposit ETH into the vault
+    /// @dev Emits {Deposited} and updates user balance
+    /// @param receiver The address to credit the deposit to
+    /// @return shares The number of vault shares minted
+    function deposit(address receiver) external payable returns (uint256 shares) {
+        // ...
+    }
+
+    /// @notice Withdraw ETH from the vault
+    /// @param amount The amount of ETH to withdraw
+    /// @custom:security nonReentrant
+    function withdraw(uint256 amount) external {
+        // ...
+    }
+}
+```
+
+**Tags:** `@title`, `@author`, `@notice` (user-facing), `@dev` (developer), `@param`, `@return`, `@inheritdoc`, `@custom:*`
+
+---
+
+## ABI Encoding Safety
+
+Use `abi.encodeCall` (Solidity 0.8.11+) for type-safe low-level calls. Avoid `abi.encodePacked` with multiple dynamic types — it creates hash collisions.
+
+```solidity
+// ❌ Hash collision — abi.encodePacked("ab", "c") == abi.encodePacked("a", "bc")
+bytes32 hash = keccak256(abi.encodePacked(name, symbol));
+
+// ✅ Safe — abi.encode adds length prefixes
+bytes32 hash = keccak256(abi.encode(name, symbol));
+
+// ❌ No type checking on args
+bytes memory data = abi.encodeWithSelector(IVault.deposit.selector, amount);
+
+// ✅ Compiler checks arg types match the function signature
+bytes memory data = abi.encodeCall(IVault.deposit, (amount));
+```
+
+See `references/security.md` → ABI Encoding Pitfalls for full patterns.
+
+---
+
+## Receive & Fallback Functions
+
+```solidity
+// receive() — called when msg.data is EMPTY and ETH is sent
+receive() external payable {
+    emit Received(msg.sender, msg.value);
+}
+
+// fallback() — called when no function selector matches, or msg.data non-empty with no receive()
+fallback() external payable {
+    _delegate(implementation);  // proxy pattern
+}
+```
+
+**Key rules:**
+- Never leave `receive()` empty (`receive() external payable {}`) unless intentional — it silently swallows ETH
+- Never leave `fallback()` empty unless it's a proxy — it masks bugs by silently accepting calls to non-existent functions
+- If a contract should NOT receive ETH, omit both `receive()` and `fallback()` (or make them revert)
+
+---
+
+## Low-Level Call Error Handling
+
+Always decode revert reasons from failed low-level calls:
+
+```solidity
+(bool ok, bytes memory returnData) = target.call(data);
+if (!ok) {
+    // Bubble up the revert reason
+    if (returnData.length > 0) {
+        assembly { revert(add(32, returnData), mload(returnData)) }
+    }
+    revert CallFailed();
+}
+```
+
+For external calls that may fail gracefully, use `try/catch`:
+
+```solidity
+try oracle.latestRoundData() returns (uint80, int256 price, uint256, uint256 updatedAt, uint80) {
+    if (price <= 0) revert InvalidPrice();
+    return uint256(price);
+} catch {
+    revert OracleCallFailed();
+}
+```
+
+---
+
+## Solidity 0.8.24+ Features
+
+Key features available in modern Solidity that you should use:
+
+| Feature | Version | Use |
+|---------|---------|-----|
+| Transient storage (`TSTORE`/`TLOAD`) | 0.8.24 | Cheap reentrancy guards, callback flags |
+| Named parameters in mappings | 0.8.18 | `mapping(address user => uint256 balance)` |
+| User-defined value types | 0.8.8 | `type TokenAmount is uint256;` — type safety |
+| `using { fn } for Type global` | 0.8.24 | File-level function attachment |
+| `bytes.concat()` | 0.8.4 | Replace `abi.encodePacked` for byte concatenation |
+| `abi.encodeCall` | 0.8.11 | Type-safe encoding for low-level calls |
+
+---
+
+## Contract Size Awareness
+
+EVM enforces a 24,576-byte limit on deployed bytecode (Spurious Dragon, EIP-170). Check with `forge build --sizes`. If your contract is approaching the limit:
+
+1. Use custom errors instead of require strings
+2. Replace modifiers with internal functions (modifiers inline at every use site)
+3. Split into base + extension contracts
+4. Enable `viaIR` in compiler settings
+5. Use external libraries for heavy logic
+6. Last resort: Diamond pattern (EIP-2535)
+
+See `references/gas-optimization.md` → Contract Size Limit for details.
+
+---
+
 ## Deployment Checklist
 
 Before deploying any contract to mainnet, verify:
@@ -314,8 +449,12 @@ Before deploying any contract to mainnet, verify:
 - [ ] Reentrancy guards on functions with external calls
 - [ ] `constant`/`immutable` used wherever values don't change
 - [ ] Custom errors used instead of string messages
+- [ ] NatSpec on all public/external functions
+- [ ] Contract size under 24KB (`forge build --sizes`)
 - [ ] Slither static analysis run and findings addressed
+- [ ] Contract verified on block explorer (Etherscan/Basescan/Arbiscan)
 - [ ] If upgradeable: storage layout verified, initializer set, `_disableInitializers()` called
+- [ ] If L2: read `references/l2-crosschain.md` for chain-specific gotchas
 
 ---
 
@@ -323,8 +462,12 @@ Before deploying any contract to mainnet, verify:
 
 - **Writing a token (ERC-20/721/1155)?** → Read `references/erc-standards.md`
 - **Setting up Foundry or Hardhat?** → Read `references/tooling.md`
-- **User asks about a security issue, audit, reentrancy, oracle manipulation?** → Read `references/security.md`
-- **Asking about proxy, UUPS, upgradeable, Diamond?** → Read `references/patterns.md`
-- **Trying to reduce gas costs?** → Read `references/gas-optimization.md`
+- **Security issue, audit, reentrancy, oracle manipulation, MEV?** → Read `references/security.md`
+- **Proxy, UUPS, upgradeable, Diamond, libraries, interfaces?** → Read `references/patterns.md`
+- **Trying to reduce gas costs or hitting contract size limit?** → Read `references/gas-optimization.md`
+- **Deploying to L2, cross-chain messaging, bridging?** → Read `references/l2-crosschain.md`
+- **Deploying to multiple chains, verifying contracts?** → Read `references/tooling.md` (verification & multi-chain sections)
+- **Accepting arbitrary ERC-20 tokens (USDT, USDC, fee-on-transfer)?** → Read `references/erc-standards.md` (token integration checklist)
+- **Using OpenZeppelin v5 (or migrating from v4)?** → Read `references/patterns.md` (OZ v5 migration section)
 
 When generating a non-trivial contract (>50 lines), always at minimum skim the relevant reference.

@@ -9,6 +9,9 @@
 6. [CI/CD Integration](#ci)
 7. [Debugging & Inspection](#debugging)
 8. [RPC Providers & Testnets](#rpc)
+9. [Contract Verification](#verification)
+10. [Testing Best Practices & Edge Cases](#testing-edge-cases)
+11. [Multi-Chain Deployment](#multi-chain)
 
 ---
 
@@ -530,3 +533,237 @@ cast storage 0xContractAddress $(cast index address 0xUser 1)  # slot for mappin
 | Optimism Sepolia | 11155420 | app.optimism.io/faucet |
 
 **Note:** Goerli and Mumbai are deprecated and should not be used.
+
+---
+
+## Contract Verification {#verification}
+
+### Foundry Verification
+
+```bash
+# Verify on Etherscan
+forge verify-contract 0xDeployedAddress src/MyContract.sol:MyContract \
+    --chain sepolia \
+    --etherscan-api-key $ETHERSCAN_API_KEY
+
+# With constructor args
+forge verify-contract 0xDeployedAddress src/MyContract.sol:MyContract \
+    --chain mainnet \
+    --constructor-args $(cast abi-encode "constructor(address,uint256)" 0xTreasury 1000) \
+    --etherscan-api-key $ETHERSCAN_API_KEY
+
+# Verify proxy implementation
+forge verify-contract 0xImplAddress src/MyContract.sol:MyContract \
+    --chain mainnet \
+    --etherscan-api-key $ETHERSCAN_API_KEY
+# Then on Etherscan UI: "Is this a proxy?" → verify proxy
+
+# Auto-verify during deployment
+forge script script/Deploy.s.sol --rpc-url sepolia --broadcast --verify
+```
+
+### Hardhat Verification
+
+```bash
+npx hardhat verify --network sepolia 0xDeployedAddress "constructorArg1" "constructorArg2"
+
+# For proxy contracts
+npx hardhat verify --network mainnet 0xImplementationAddress
+```
+
+### Sourcify (decentralized verification)
+
+- Alternative to Etherscan — fully open-source
+
+```bash
+forge verify-contract 0xAddress src/Contract.sol:Contract \
+    --verifier sourcify --chain-id 1
+```
+
+### Multi-file vs Flattened
+
+- Foundry/Hardhat submit standard JSON input (preferred — preserves imports)
+- Flattened: `forge flatten src/Contract.sol > Flat.sol` (last resort)
+- Common issue: mismatched compiler settings — ensure exact same version, optimizer settings, viaIR flag
+
+### Verification Troubleshooting
+
+| Problem | Fix |
+|---------|-----|
+| "ByteCode does not match" | Check compiler version, optimizer runs, viaIR flag |
+| Constructor args wrong | Use `cast abi-encode` to get exact encoding |
+| Proxy not showing as proxy | Use Etherscan "More Options → Is this a proxy?" |
+| Libraries not linked | Pass `--libraries` flag with deployed library addresses |
+
+---
+
+## Testing Best Practices & Edge Cases {#testing-edge-cases}
+
+### Edge Cases Every Test Suite Should Cover
+
+```solidity
+// Boundary values
+function test_MaxUint256() public {
+    vm.expectRevert();  // or handle gracefully
+    vault.deposit(type(uint256).max);
+}
+
+function test_ZeroAmount() public {
+    vm.expectRevert(Vault.ZeroAmount.selector);
+    vault.deposit(0);
+}
+
+function test_ZeroAddress() public {
+    vm.expectRevert(Vault.ZeroAddress.selector);
+    vault.transfer(address(0), 100);
+}
+
+// Empty arrays
+function test_EmptyArray() public {
+    uint256[] memory empty = new uint256[](0);
+    vault.batchDeposit(empty);  // should handle gracefully
+}
+
+// Same-block interactions
+function test_DepositAndWithdrawSameBlock() public {
+    vault.deposit{value: 1 ether}();
+    vault.withdraw(1 ether);  // some protocols restrict this
+}
+
+// Reentrancy attempt
+function test_ReentrancyProtection() public {
+    ReentrantAttacker attacker = new ReentrantAttacker(vault);
+    vm.deal(address(attacker), 10 ether);
+    vm.expectRevert();  // should revert on re-entry
+    attacker.attack();
+}
+
+// Overflow in multiplication before division
+function testFuzz_NoOverflowInFeeCalc(uint256 amount, uint256 feeBps) public {
+    amount = bound(amount, 0, type(uint128).max);
+    feeBps = bound(feeBps, 0, 10_000);
+    uint256 fee = (amount * feeBps) / 10_000;
+    assertLe(fee, amount);
+}
+```
+
+### Fork Testing Patterns
+
+```solidity
+// Test against real mainnet state
+function test_SwapOnUniswap() public {
+    vm.createSelectFork("mainnet", 19_000_000);  // pin block for reproducibility
+
+    ISwapRouter router = ISwapRouter(0xE592427A0AEce92De3Edee1F18E0157C05861564);
+    // ... test real swap
+}
+
+// Multi-fork testing
+function test_CrossChainState() public {
+    uint256 mainnetFork = vm.createFork("mainnet");
+    uint256 arbitrumFork = vm.createFork("arbitrum");
+
+    vm.selectFork(mainnetFork);
+    uint256 l1Balance = token.balanceOf(bridge);
+
+    vm.selectFork(arbitrumFork);
+    uint256 l2Supply = token.totalSupply();
+
+    assertEq(l1Balance, l2Supply);  // bridge invariant
+}
+```
+
+### Test Organization Convention
+
+```
+test/
+├── unit/              # isolated function tests
+│   ├── Vault.deposit.t.sol
+│   └── Vault.withdraw.t.sol
+├── integration/       # multi-contract interactions
+│   └── VaultRouter.t.sol
+├── fuzz/              # property-based tests
+│   └── Vault.fuzz.t.sol
+├── invariant/         # stateful invariant tests
+│   ├── handlers/
+│   │   └── VaultHandler.sol
+│   └── Vault.invariant.t.sol
+└── fork/              # mainnet fork tests
+    └── VaultMainnet.t.sol
+```
+
+---
+
+## Multi-Chain Deployment {#multi-chain}
+
+### Foundry Multi-Chain Script
+
+```solidity
+// script/DeployMultiChain.s.sol
+pragma solidity ^0.8.24;
+
+import "forge-std/Script.sol";
+import "../src/MyContract.sol";
+
+contract DeployMultiChain is Script {
+    struct ChainConfig {
+        string rpcAlias;
+        address treasury;
+        uint256 feeBps;
+    }
+
+    function run() external {
+        // Deploy to current --rpc-url chain
+        uint256 deployerKey = vm.envUint("PRIVATE_KEY");
+        address treasury = vm.envAddress("TREASURY");
+
+        vm.startBroadcast(deployerKey);
+        MyContract c = new MyContract(treasury);
+        console.log("Deployed to:", address(c));
+        vm.stopBroadcast();
+    }
+}
+```
+
+```bash
+# Deploy to multiple chains sequentially
+forge script script/Deploy.s.sol --rpc-url sepolia --broadcast --verify
+forge script script/Deploy.s.sol --rpc-url base-sepolia --broadcast --verify
+forge script script/Deploy.s.sol --rpc-url arbitrum-sepolia --broadcast --verify
+
+# Same address via CREATE2 (use a deterministic deployer)
+forge script script/DeployCreate2.s.sol --rpc-url sepolia --broadcast
+forge script script/DeployCreate2.s.sol --rpc-url base --broadcast
+# Both deploy to the same address if salt and initcode match
+```
+
+### Chain-Specific Configuration
+
+```toml
+# foundry.toml
+[rpc_endpoints]
+mainnet = "${MAINNET_RPC}"
+sepolia = "${SEPOLIA_RPC}"
+base = "${BASE_RPC}"
+base-sepolia = "${BASE_SEPOLIA_RPC}"
+arbitrum = "${ARBITRUM_RPC}"
+arbitrum-sepolia = "${ARBITRUM_SEPOLIA_RPC}"
+optimism = "${OPTIMISM_RPC}"
+
+[etherscan]
+mainnet = { key = "${ETHERSCAN_API_KEY}" }
+sepolia = { key = "${ETHERSCAN_API_KEY}" }
+base = { key = "${BASESCAN_API_KEY}", url = "https://api.basescan.org/api" }
+arbitrum = { key = "${ARBISCAN_API_KEY}", url = "https://api.arbiscan.io/api" }
+optimism = { key = "${OPTIMISTIC_API_KEY}", url = "https://api-optimistic.etherscan.io/api" }
+```
+
+### Block Explorer APIs
+
+| Chain | Explorer | API Base URL |
+|-------|----------|-------------|
+| Ethereum | Etherscan | api.etherscan.io |
+| Base | Basescan | api.basescan.org |
+| Arbitrum | Arbiscan | api.arbiscan.io |
+| Optimism | Optimistic Etherscan | api-optimistic.etherscan.io |
+| Polygon | Polygonscan | api.polygonscan.com |

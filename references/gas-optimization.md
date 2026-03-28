@@ -9,7 +9,10 @@
 6. [Deployment Optimization](#deployment)
 7. [Yul Assembly Patterns](#yul)
 8. [Measurement Tools](#measurement)
-9. [Quick Reference Table](#reference-table)
+9. [Contract Size Limit (24KB)](#contract-size)
+10. [Transient Storage Patterns (EIP-1153)](#transient-storage)
+11. [Events as Cheap Storage](#events-as-storage)
+12. [Quick Reference Table](#reference-table)
 
 ---
 
@@ -420,6 +423,397 @@ gasReporter: {
 
 ---
 
+## Contract Size Limit (24KB) {#contract-size}
+
+The Spurious Dragon hard fork introduced a maximum deployed bytecode size of **24,576 bytes** (24 KB) per contract. Any contract exceeding this limit will fail to deploy.
+
+### Checking Contract Size
+
+```bash
+# Foundry — prints a table of contract sizes
+forge build --sizes
+
+# Hardhat — compile with size output
+npx hardhat compile
+# or add `contractSizer` plugin for detailed reports:
+# npm install hardhat-contract-sizer
+```
+
+### Common Causes of Bytecode Bloat
+
+| Cause | Why It Bloats | Fix |
+|-------|--------------|-----|
+| Long `require` strings | Each string is stored in bytecode | Use custom errors |
+| Modifier inlining | Modifier code is copied to every call site | Use internal functions instead |
+| Large ABI / many functions | Each external function adds dispatch logic | Split into facets or extensions |
+| Dead code & unused imports | Compiler may not fully strip them | Remove manually |
+| Heavy inheritance chains | Inherited functions compiled into child | Flatten or split |
+
+### Solutions
+
+**1. Split into multiple contracts with delegation:**
+
+```solidity
+// ❌ One fat contract that exceeds 24KB
+contract MonolithicProtocol {
+    // ... hundreds of functions ...
+}
+
+// ✅ Base contract with core logic, extensions for the rest
+contract ProtocolCore {
+    address public immutable extensions;
+
+    constructor(address _extensions) {
+        extensions = _extensions;
+    }
+
+    function deposit(uint256 amount) external { /* core logic */ }
+    function withdraw(uint256 amount) external { /* core logic */ }
+
+    // Delegate non-core operations
+    fallback() external payable {
+        address ext = extensions;
+        assembly {
+            calldatacopy(0, 0, calldatasize())
+            let result := delegatecall(gas(), ext, 0, calldatasize(), 0, 0)
+            returndatacopy(0, 0, returndatasize())
+            switch result
+            case 0 { revert(0, returndatasize()) }
+            default { return(0, returndatasize()) }
+        }
+    }
+}
+
+contract ProtocolExtensions {
+    function claimRewards(address user) external { /* ... */ }
+    function updateSettings(bytes calldata config) external { /* ... */ }
+    // ... additional functions that don't fit in core
+}
+```
+
+**2. Use external libraries to offload bytecode:**
+
+```solidity
+// Library functions called via DELEGATECALL — their bytecode lives separately
+library MathLib {
+    function complexCalculation(uint256 a, uint256 b) external pure returns (uint256) {
+        // ... heavy logic here doesn't count toward caller's size
+    }
+}
+
+contract MyContract {
+    using MathLib for uint256;
+    // MathLib.complexCalculation is an external call — not inlined
+}
+```
+
+**3. Compiler settings:**
+
+```toml
+# foundry.toml
+[profile.default]
+optimizer = true
+optimizer_runs = 200    # lower runs = smaller bytecode
+via_ir = true           # can reduce size 10-30%
+```
+
+**4. Internal functions instead of modifiers:**
+
+```solidity
+// ❌ Modifier inlines at every use — if used 10 times, 10 copies in bytecode
+modifier onlyAdmin() {
+    require(msg.sender == admin, "Not admin");
+    _;
+}
+
+// ✅ Internal function — one copy in bytecode, called via JUMP
+function _onlyAdmin() internal view {
+    if (msg.sender != admin) revert NotAdmin();
+}
+```
+
+**5. Diamond pattern (EIP-2535) — last resort for very large protocols:**
+
+When splitting into two contracts is not enough, the Diamond pattern allows unlimited facets (logic contracts) behind a single proxy address.
+
+---
+
+## Transient Storage Patterns (EIP-1153) {#transient-storage}
+
+Transient storage provides **storage that is automatically cleared at the end of each transaction**. It uses the `TSTORE` and `TLOAD` opcodes introduced in the Cancun/Dencun upgrade.
+
+### Cost Comparison
+
+| Operation | Gas Cost | Notes |
+|-----------|----------|-------|
+| TSTORE | 100 | Write to transient slot |
+| TLOAD | 100 | Read from transient slot |
+| SSTORE (new, nonzero) | ~22,100 | Write to regular storage (cold, zero→nonzero) |
+| SSTORE (modify) | ~5,000 | Write to regular storage (warm) |
+| SLOAD (cold) | 2,100 | Read from regular storage (cold) |
+
+### Solidity Syntax (0.8.24+)
+
+```solidity
+// Declare a transient variable — cleared automatically after each transaction
+uint256 transient private _reentrancyStatus;
+```
+
+### Use Case 1: Cheap Reentrancy Lock
+
+```solidity
+// ❌ Traditional reentrancy guard — costs ~5,000+ gas per lock/unlock (SSTORE)
+contract ExpensiveGuard {
+    uint256 private _status = 1; // NOT_ENTERED
+
+    modifier nonReentrant() {
+        require(_status != 2, "Reentrant");
+        _status = 2;    // SSTORE: ~5,000 gas
+        _;
+        _status = 1;    // SSTORE: ~2,900 gas (refund applies)
+    }
+}
+
+// ✅ Transient reentrancy guard — costs ~200 gas total (2 × TSTORE at 100 each)
+contract CheapGuard {
+    uint256 transient private _status;
+
+    modifier nonReentrant() {
+        if (_status != 0) revert ReentrancyDetected();
+        _status = 1;    // TSTORE: 100 gas — auto-cleared after tx
+        _;
+        _status = 0;    // TSTORE: 100 gas
+    }
+}
+// Savings: ~7,700 gas per guarded call
+```
+
+### Use Case 2: Callback Validation
+
+```solidity
+contract FlashLender {
+    address transient private _currentBorrower;
+
+    function flashLoan(address borrower, uint256 amount) external {
+        _currentBorrower = borrower;       // TSTORE: set flag before callback
+        IERC20(token).transfer(borrower, amount);
+        IFlashBorrower(borrower).onFlashLoan(amount);
+
+        // Verify repayment
+        require(
+            IERC20(token).balanceOf(address(this)) >= amount + fee,
+            "Not repaid"
+        );
+        _currentBorrower = address(0);     // TSTORE: clear flag
+    }
+
+    // Only callable during an active flash loan from the current borrower
+    function verifyCallback() external view {
+        if (_currentBorrower != msg.sender) revert InvalidCallback();
+    }
+}
+```
+
+### Use Case 3: Cross-Function Communication
+
+```solidity
+contract Vault {
+    bool transient private _permitUsed;
+
+    /// @notice Permit + deposit in a single transaction
+    function permitAndDeposit(
+        uint256 amount,
+        uint256 deadline,
+        uint8 v, bytes32 r, bytes32 s
+    ) external {
+        IERC20Permit(token).permit(msg.sender, address(this), amount, deadline, v, r, s);
+        _permitUsed = true;    // TSTORE: signal to deposit logic
+        _deposit(msg.sender, amount);
+        // _permitUsed auto-cleared at end of tx
+    }
+
+    function _deposit(address user, uint256 amount) internal {
+        if (_permitUsed) {
+            // Skip allowance check — permit was just called
+        }
+        // ... deposit logic
+    }
+}
+```
+
+### Use Case 4: Temporary Approval Patterns
+
+```solidity
+contract TokenWithTransientApproval {
+    mapping(address => mapping(address => uint256)) transient private _tempAllowance;
+
+    /// @notice Grant a one-transaction approval that auto-expires
+    function approveOnce(address spender, uint256 amount) external {
+        _tempAllowance[msg.sender][spender] = amount;  // TSTORE
+    }
+
+    function transferFrom(address from, address to, uint256 amount) external {
+        uint256 tempAllow = _tempAllowance[from][msg.sender];  // TLOAD
+        if (tempAllow >= amount) {
+            _tempAllowance[from][msg.sender] = tempAllow - amount;
+        } else {
+            // Fall back to persistent allowance
+            _spendAllowance(from, msg.sender, amount);
+        }
+        _transfer(from, to, amount);
+    }
+}
+```
+
+### When NOT to Use Transient Storage
+
+- **Any data that must persist across transactions** — transient storage is wiped clean after every tx
+- **Cross-contract reads in separate transactions** — the data will not be there
+- **State that needs to survive `SELFDESTRUCT` within the same tx** — behavior is undefined
+
+### Compatibility
+
+Transient storage requires the **Cancun/Dencun** upgrade. As of 2025:
+- **Supported:** Ethereum mainnet, Arbitrum, Optimism, Base, Polygon zkEVM, most major L2s
+- **Check before deploying** on newer or niche chains — verify `TSTORE`/`TLOAD` opcode support
+
+---
+
+## Events as Cheap Storage {#events-as-storage}
+
+Events (LOG opcodes) provide a way to record data on-chain at a fraction of the cost of storage, with the trade-off that **event data is not readable by smart contracts** — only by offchain services.
+
+### Cost Comparison
+
+| Method | Gas Cost | Readable On-Chain? |
+|--------|----------|--------------------|
+| SSTORE (new nonzero) | ~22,100 | Yes |
+| SSTORE (modify) | ~5,000 | Yes |
+| LOG0 (no topics) | 375 base + 8/byte | No |
+| LOG1 (1 topic) | 750 base + 8/byte | No |
+| LOG2 (2 topics) | 1,125 base + 8/byte | No |
+
+A typical event with 2 indexed parameters and 64 bytes of data costs roughly **~1,600 gas** — compared to **22,100+** for equivalent storage writes.
+
+### When to Use Events Over Storage
+
+| Use Case | Store On-Chain? | Emit Event? |
+|----------|----------------|-------------|
+| Active order that contracts must read | Yes | Optional |
+| Historical trade record for analytics | No | Yes |
+| Audit trail of admin actions | No | Yes |
+| Configuration change log | No | Yes |
+| User activity history | No | Yes |
+| Data needed by frontend only | No | Yes |
+
+### Pattern: Minimal Storage + Rich Events
+
+```solidity
+contract OrderBook {
+    // On-chain: only store what contracts need to verify
+    mapping(bytes32 => bool) public activeOrderHashes;
+    uint256 public orderCount;
+
+    event OrderPlaced(
+        bytes32 indexed orderHash,
+        address indexed maker,
+        address indexed tokenIn,
+        address tokenOut,
+        uint256 amountIn,
+        uint256 amountOut,
+        uint256 expiry,
+        uint256 timestamp
+    );
+
+    event OrderCancelled(bytes32 indexed orderHash, address indexed maker);
+    event OrderFilled(bytes32 indexed orderHash, address indexed taker, uint256 fillAmount);
+
+    struct Order {
+        address maker;
+        address tokenIn;
+        address tokenOut;
+        uint256 amountIn;
+        uint256 amountOut;
+        uint256 expiry;
+    }
+
+    function placeOrder(Order calldata order) external returns (bytes32 orderHash) {
+        orderHash = keccak256(abi.encode(order, orderCount++));
+
+        // ✅ Store only the hash on-chain — 1 SSTORE (~22,100 gas)
+        activeOrderHashes[orderHash] = true;
+
+        // ✅ Emit full details as event — ~1,600 gas (vs ~110,000+ to store all fields)
+        emit OrderPlaced(
+            orderHash,
+            order.maker,
+            order.tokenIn,
+            order.tokenOut,
+            order.amountIn,
+            order.amountOut,
+            order.expiry,
+            block.timestamp
+        );
+    }
+
+    function cancelOrder(Order calldata order, uint256 nonce) external {
+        bytes32 orderHash = keccak256(abi.encode(order, nonce));
+        require(activeOrderHashes[orderHash], "Not active");
+        require(order.maker == msg.sender, "Not maker");
+
+        delete activeOrderHashes[orderHash];    // SSTORE: refund ~4,800 gas
+        emit OrderCancelled(orderHash, msg.sender);
+    }
+
+    function fillOrder(Order calldata order, uint256 nonce, uint256 fillAmount) external {
+        bytes32 orderHash = keccak256(abi.encode(order, nonce));
+        require(activeOrderHashes[orderHash], "Not active");
+
+        // ... execute swap logic ...
+
+        delete activeOrderHashes[orderHash];
+        emit OrderFilled(orderHash, msg.sender, fillAmount);
+    }
+}
+```
+
+**Gas savings:** storing all 7 order fields would cost ~110,000+ gas (5 storage slots). Storing only the hash + emitting an event costs ~23,700 gas — an **~80% reduction**.
+
+### Offchain Indexing with The Graph
+
+Events emitted on-chain can be indexed by [The Graph](https://thegraph.com/) subgraphs, making them queryable by frontends:
+
+```yaml
+# subgraph.yaml — event handler mapping
+eventHandlers:
+  - event: OrderPlaced(indexed bytes32, indexed address, indexed address, address, uint256, uint256, uint256, uint256)
+    handler: handleOrderPlaced
+  - event: OrderCancelled(indexed bytes32, indexed address)
+    handler: handleOrderCancelled
+  - event: OrderFilled(indexed bytes32, indexed address, uint256)
+    handler: handleOrderFilled
+```
+
+```typescript
+// mapping.ts — The Graph handler
+export function handleOrderPlaced(event: OrderPlaced): void {
+    let order = new OrderEntity(event.params.orderHash.toHex());
+    order.maker = event.params.maker;
+    order.tokenIn = event.params.tokenIn;
+    order.tokenOut = event.params.tokenOut;
+    order.amountIn = event.params.amountIn;
+    order.amountOut = event.params.amountOut;
+    order.expiry = event.params.expiry;
+    order.timestamp = event.params.timestamp;
+    order.status = "ACTIVE";
+    order.save();
+}
+```
+
+Other indexing services (Dune Analytics, Ponder, Envio) can similarly consume these events for dashboards and analytics.
+
+---
+
 ## Quick Reference Table {#reference-table}
 
 | Technique | Gas Saving | Complexity |
@@ -437,3 +831,6 @@ gasReporter: {
 | Batch transactions | 21k base fee × n-1 | Medium |
 | `via_ir` compiler | 5-30% runtime | Zero |
 | Yul assembly | Variable (10-50%) | High |
+| Contract splitting | Avoids 24KB limit | Medium |
+| Transient storage | ~22,000/lock operation | Low |
+| Events over storage | ~5,000-22,000/write | Low |

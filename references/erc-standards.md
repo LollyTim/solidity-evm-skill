@@ -10,6 +10,7 @@
 7. [ERC-4337 — Account Abstraction](#erc4337)
 8. [ERC-165 — Interface Detection](#erc165)
 9. [Other Key EIPs](#other-eips)
+10. [Token Integration Checklist](#token-checklist)
 
 ---
 
@@ -90,6 +91,60 @@ function depositWithPermit(
     IERC20(address(token)).safeTransferFrom(msg.sender, address(this), amount);
 }
 ```
+
+### ERC-20 Approval Race Condition & Permit2
+
+**The classic approve race condition:**
+A user has approved a spender for 100 tokens and wants to change the approval to 50. A malicious miner/validator can front-run the `approve(50)` call: first spend the existing 100 allowance, then the new 50 approval lands, giving the spender 150 total instead of the intended 50.
+
+**Solutions:**
+
+1. **`increaseAllowance` / `decreaseAllowance`** (OpenZeppelin pattern) — adjust allowance relative to current value, avoiding the race
+2. **Approve to 0 first, then to the new amount** — requires two transactions, but prevents the exploit since a front-runner can only spend 0 after the first tx
+3. **Permit2** (Uniswap's universal approval manager) — the modern solution that eliminates per-protocol approvals entirely
+
+**Permit2 explained:**
+
+Permit2 is a canonical contract deployed by Uniswap that acts as a universal token approval manager:
+
+- User approves the Permit2 contract once with max approval for each token
+- Individual protocols receive scoped, time-limited, revocable permits via off-chain signatures
+- Two modes:
+  - `SignatureTransfer` — one-time permit consumed immediately (nonce-based)
+  - `AllowanceTransfer` — recurring permit with amount and expiration (traditional allowance model, but managed by Permit2)
+- Canonical address (same on all chains): `0x000000000022D473030F116dDEE9F6B43aC78BA3`
+
+**Protocol integration with Permit2:**
+
+```solidity
+import {ISignatureTransfer} from "permit2/src/interfaces/ISignatureTransfer.sol";
+
+contract MyProtocol {
+    ISignatureTransfer public immutable permit2;
+
+    constructor(ISignatureTransfer _permit2) {
+        permit2 = _permit2;
+    }
+
+    function depositWithPermit2(
+        ISignatureTransfer.PermitTransferFrom calldata permit,
+        ISignatureTransfer.SignatureTransferDetails calldata transferDetails,
+        bytes calldata signature
+    ) external {
+        permit2.permitTransferFrom(permit, transferDetails, msg.sender, signature);
+        // ... credit user
+    }
+}
+```
+
+**When to use Permit2 vs EIP-2612 Permit:**
+
+| Feature | EIP-2612 | Permit2 |
+|---------|----------|---------|
+| Token must support it | Yes (built-in) | No (works with any ERC-20) |
+| One approval per protocol | No | Yes (approve Permit2 once) |
+| Expiration | Yes | Yes |
+| Batch support | No | Yes |
 
 ---
 
@@ -418,6 +473,8 @@ bool isERC721 = IERC165(tokenAddress).supportsInterface(type(IERC721).interfaceI
 | EIP-6780 | SELFDESTRUCT | Post-Cancun: only works in constructor |
 | EIP-7201 | Namespaced Storage | Safe storage layout for complex upgradeable contracts |
 | EIP-1153 | Transient Storage | TSTORE/TLOAD: cheap temporary storage (cleared after tx) |
+| EIP-2771 | Meta Transactions | Trusted forwarder pattern for gasless transactions |
+| EIP-5267 | EIP-712 Domain Discovery | Retrieve EIP-712 domain info from contracts |
 
 ### Transient Storage (EIP-1153 — Solidity 0.8.24+)
 
@@ -434,3 +491,31 @@ modifier nonReentrant() {
 ```
 
 Transient storage costs: 100 gas (write) vs 22,100 gas (regular storage write). Cleared automatically after transaction.
+
+---
+
+## Token Integration Checklist {#token-checklist}
+
+A checklist for protocols that accept arbitrary ERC-20 tokens:
+
+- [ ] Use `SafeERC20` for all transfers (handles non-standard return values)
+- [ ] Handle fee-on-transfer tokens (check balance before/after transfer)
+- [ ] Handle rebase tokens (don't cache balanceOf, or explicitly exclude them)
+- [ ] Handle tokens with decimals != 18 (USDC=6, WBTC=8)
+- [ ] Handle tokens that can pause (USDC, USDT)
+- [ ] Handle tokens that can blacklist (USDC, USDT)
+- [ ] Handle tokens with max uint256 approval meaning "infinite" (some tokens)
+- [ ] Don't assume `transferFrom` returns true — some return nothing
+- [ ] Check for zero-amount transfer behavior (some tokens revert on 0)
+- [ ] Consider tokens with callbacks (ERC-777, ERC-1363) — reentrancy risk
+
+```solidity
+// Pattern: safe deposit handling for fee-on-transfer tokens
+function deposit(IERC20 token, uint256 amount) external {
+    uint256 balanceBefore = token.balanceOf(address(this));
+    token.safeTransferFrom(msg.sender, address(this), amount);
+    uint256 actualReceived = token.balanceOf(address(this)) - balanceBefore;
+    // Credit user with actualReceived, NOT amount
+    balances[msg.sender] += actualReceived;
+}
+```
