@@ -22,6 +22,8 @@ This SKILL.md provides principles, patterns, and rules. For deep reference mater
 | `references/tooling.md` | Foundry & Hardhat setup, test writing, deployment scripts, CI, contract verification, multi-chain deploy |
 | `references/erc-standards.md` | ERC-20, ERC-721, ERC-1155, ERC-4626, ERC-2981, ERC-4337, EIP-712, Permit2, token integration checklist |
 | `references/l2-crosschain.md` | L2 gotchas, cross-chain messaging, bridge patterns, multi-chain deployment, L2 gas models |
+| `references/evm-internals.md` | EVM architecture, data locations, ABI encoding, DELEGATECALL, CREATE/CREATE2, opcodes, bytecode |
+| `references/natspec-quality.md` | NatSpec documentation, Solidity style guide, code review checklist, SWC vulnerability IDs |
 
 Read the relevant reference **before** generating code for any non-trivial task. For tasks touching security, proxy patterns, or unfamiliar ERCs, always read the reference.
 
@@ -469,5 +471,7 @@ Before deploying any contract to mainnet, verify:
 - **Deploying to multiple chains, verifying contracts?** → Read `references/tooling.md` (verification & multi-chain sections)
 - **Accepting arbitrary ERC-20 tokens (USDT, USDC, fee-on-transfer)?** → Read `references/erc-standards.md` (token integration checklist)
 - **Using OpenZeppelin v5 (or migrating from v4)?** → Read `references/patterns.md` (OZ v5 migration section)
+- **Need to understand EVM internals, storage slots, DELEGATECALL, opcodes?** → Read `references/evm-internals.md`
+- **Writing NatSpec, code review, style guide, SWC IDs?** → Read `references/natspec-quality.md`
 
 When generating a non-trivial contract (>50 lines), always at minimum skim the relevant reference.

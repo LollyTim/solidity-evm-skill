@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(wc -l SKILL.md references/*.md)",
+      "Bash(curl -s -L https://docs.arbitrum.io/build-decentralized-apps/arbitrum-vs-ethereum/block-numbers-and-time)",
+      "Bash(curl -s -L https://docs.optimism.io/chain/addresses)",
+      "WebSearch",
+      "Bash(curl -s -L https://docs.arbitrum.io/build-decentralized-apps/precompiles/reference)",
+      "Bash(curl -s -L https://docs.optimism.io/stack/transactions/fees)",
+      "Bash(curl -s -L https://docs.arbitrum.io/arbos/l1-to-l2-messaging)",
+      "WebFetch(domain:docs.optimism.io)",
+      "Bash(curl -s -L https://docs.arbitrum.io/build-decentralized-apps/reference/useful-addresses)",
+      "WebFetch(domain:medium.com)",
+      "Bash(curl -s -L https://docs.arbitrum.io/build-decentralized-apps/nodeinterface/reference)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:docs.arbitrum.io)"
+    ]
+  }
+}
